@@ -1,0 +1,142 @@
+name: Publish Terraform Tooling to GAR
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image version (e.g. 0.1.0); do not reuse published versions"
+        required: true
+        type: string
+  # PRs should validate the Dockerfile separately, without cloud credentials.
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-terraform-tooling
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: tooling-publish
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      image: ${{ steps.target.outputs.image }}
+    steps:
+    - name: Validate release version
+      env:
+        IMAGE_VERSION: ${{ inputs.version }}
+      run: |
+        if [[ ! "$IMAGE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+          echo 'Version must be numeric SemVer (for example, 0.1.0)' >&2
+          exit 1
+        fi
+
+    - name: Checkout tooling source
+      uses: actions/checkout@v4:11d5960a326750d5838078e36cf38b85af677262
+      with:
+        persist-credentials: false
+
+    - name: Select image destination
+      id: target
+      env:
+        GAR_LOCATION: ${{ vars.GAR_LOCATION }}
+        GAR_PROJECT_ID: ${{ vars.GAR_PROJECT_ID }}
+        GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY }}
+      run: |
+        set -euo pipefail
+        for var in GAR_LOCATION GAR_PROJECT_ID GAR_REPOSITORY; do
+          [[ -n "${!var}" ]] || { echo "Missing GitHub variable: $var" >&2; exit 1; }
+        done
+        for value in "$GAR_LOCATION" "$GAR_PROJECT_ID" "$GAR_REPOSITORY"; do
+          [[ "$value" =~ ^[a-z][a-z0-9-]*$ ]] || { echo "Invalid GAR configuration" >&2; exit 1; }
+        done
+        echo "registry=${GAR_LOCATION}-docker.pkg.dev" >> "$GITHUB_OUTPUT"
+        echo "image=${GAR_LOCATION}-docker.pkg.dev/${GAR_PROJECT_ID}/${GAR_REPOSITORY}/terraform-tooling" >> "$GITHUB_OUTPUT"
+
+    - name: Configure Docker Buildx
+      uses: docker/setup-buildx-action@v4:f87e5991a6d7451dcb8d9637bfbc97413f497069
+
+    - name: Build locally for smoke test
+      uses: docker/build-push-action@v7:c3c9e263c25d99ce0380d002d59b67737d91b0dc
+      with:
+        context: ./docker/terraform-tooling
+        file: ./docker/terraform-tooling/Dockerfile
+        platforms: linux/amd64
+        load: true
+        tags: terraform-tooling:smoke
+
+    - name: Smoke test tooling
+      run: |
+        docker run --rm terraform-tooling:smoke bash -lc 'terraform version && tflint --version && checkov --version && jq --version'
+
+    - name: Authenticate to Google Cloud via WIF
+      id: auth
+      uses: google-github-actions/auth@v3:7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+      with:
+        token_format: access_token
+        workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ vars.GCP_ARTIFACT_WRITER_SA }}
+
+    - name: Authenticate Docker to GAR
+      uses: docker/login-action@v4:8aa5831fb8d48d8f76594c7ddde61ae58019f550
+      with:
+        registry: ${{ steps.target.outputs.registry }}
+        username: oauth2accesstoken
+        password: ${{ steps.auth.outputs.access_token }}
+
+    - name: Push tooling image with supply-chain attestations
+      id: build
+      uses: docker/build-push-action@v7 # Pin audited SHA
+      with:
+        context: ./docker/terraform-tooling
+        file: ./docker/terraform-tooling/Dockerfile
+        platforms: linux/amd64
+        push: true
+        tags: ${{ steps.target.outputs.image }}:${{ inputs.version }}
+        provenance: mode=min
+        sbom: true
+        labels: |
+          org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          org.opencontainers.image.revision=${{ github.sha }}
+          org.opencontainers.image.version=${{ inputs.version }}
+
+    - name: Publish immutable image digest
+      env:
+        IMAGE: ${{ steps.target.outputs.image }}
+        DIGEST: ${{ steps.build.outputs.digest }}
+      run: |
+        echo "### Terraform tooling release" >> "$GITHUB_STEP_SUMMARY"
+        echo "Image: \`${IMAGE}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+        echo "Consumers should pin this digest, not the mutable tag." >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Install Cosign
+      uses: sigstore/cosign-installer@v4.1.0
+
+    - name: Sign Terraform tooling image
+      env:
+        IMAGE: ${{ steps.target.outputs.image }}
+        DIGEST: ${{ steps.build.outputs.digest }}
+        COSIGN_KMS_KEY: ${{ vars.COSIGN_KMS_KEY_URI }}
+      run: |
+        set -euo pipefail
+
+        cosign sign --yes \
+          --key "$COSIGN_KMS_KEY" \
+          "${IMAGE}@${DIGEST}"
+
+    - name: Verify Terraform tooling signature
+      env:
+        IMAGE: ${{ steps.target.outputs.image }}
+        DIGEST: ${{ steps.build.outputs.digest }}
+        COSIGN_KMS_KEY: ${{ vars.COSIGN_KMS_KEY_URI }}
+      run: |
+        set -euo pipefail
+
+        cosign verify \
+          --key "$COSIGN_KMS_KEY" \
+          "${IMAGE}@${DIGEST}"
