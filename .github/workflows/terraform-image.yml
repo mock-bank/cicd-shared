@@ -1,0 +1,78 @@
+name: Reusable Terraform Tooling Image Checks
+
+on:
+  workflow_call:
+    inputs:
+      tooling-image:
+        description: Full GAR image pinned to sha256 digest (no tags)
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  id-token: write # Used only to obtain read access to the tooling image in GAR
+
+jobs:
+  verify:
+    name: Verify pinned tooling image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    env:
+      TOOLING_IMAGE: ${{ inputs.tooling-image }}
+
+    steps:
+    - name: Validate image reference
+      run: |
+        set -euo pipefail
+        if [[ ! "$TOOLING_IMAGE" =~ ^[a-z][a-z0-9-]*-docker\.pkg\.dev/[a-z][a-z0-9-]*/[a-z][a-z0-9_-]*/[a-zA-Z0-9_.-]+@sha256:[a-fA-F0-9]{64}$ ]]; then
+          echo 'tooling-image must be a GAR reference pinned by sha256 digest' >&2
+          exit 1
+        fi
+
+    - name: Derive registry from the pinned image
+      id: target
+      run: |
+        set -euo pipefail
+        echo "registry=${TOOLING_IMAGE%%/*}" >> "$GITHUB_OUTPUT"
+
+    - name: Obtain short-lived GAR reader token
+      id: gar-auth
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ vars.GCP_ARTIFACT_READER_SA }}
+        token_format: access_token
+        create_credentials_file: false
+        export_environment_variables: false
+
+    - name: Login to GAR (runner only)
+      uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      with:
+        registry: ${{ steps.target.outputs.registry }}
+        username: oauth2accesstoken
+        password: ${{ steps.gar-auth.outputs.access_token }}
+
+    - name: Install Cosign
+      uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+
+    - name: Verify image signature
+      env:
+        COSIGN_KMS_KEY: ${{ vars.COSIGN_KMS_KEY_URI }}
+      run: |
+        set -euo pipefail
+        [[ -n "$COSIGN_KMS_KEY" ]] || { echo 'Missing GitHub variable: COSIGN_KMS_KEY_URI' >&2; exit 1; }
+        cosign verify --key "$COSIGN_KMS_KEY" "$TOOLING_IMAGE"
+
+    - name: Smoke test pinned image
+      run: |
+        set -euo pipefail
+        docker pull "$TOOLING_IMAGE"
+        docker run --rm \
+          --user "$(id -u):$(id -g)" \
+          --cap-drop ALL \
+          --security-opt no-new-privileges \
+          --pids-limit 256 \
+          --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+          "$TOOLING_IMAGE" \
+          bash -lc 'terraform version && tflint --version && checkov --version && jq --version'

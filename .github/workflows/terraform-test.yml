@@ -1,0 +1,61 @@
+name: Reusable Terraform Tests
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Terraform root relative to the calling repository
+        type: string
+        required: true
+      tooling-image:
+        description: Full GAR image pinned to sha256 digest (no tags)
+        type: string
+        required: true
+      enable-tflint:
+        description: Run TFLint with repository configuration
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # Used only to obtain read access to the tooling image in GAR
+
+jobs:
+  validate:
+    name: Terraform format, init, validate and lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout application repository
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        persist-credentials: false
+
+    # Authenticate on the runner BEFORE starting a Docker container.
+    # No GCP credentials file is written to the checkout workspace.
+    - name: Obtain short-lived GAR reader token
+      id: gar-auth
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ vars.GCP_ARTIFACT_READER_SA }}
+        token_format: access_token
+        create_credentials_file: false
+        export_environment_variables: false
+
+    - name: Login to GAR (runner only)
+      uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      with:
+        registry: ${{ vars.GAR_LOCATION }}-docker.pkg.dev
+        username: oauth2accesstoken
+        password: ${{ steps.gar-auth.outputs.access_token }}
+
+    # The composite action lives in this repository, not in a third-party repo.
+    # Pin a reviewed SHA or release tag together with the workflows in one platform release.
+    - name: Execute Terraform validation in image
+      uses: mock-bank/cicd-shared/.github/actions/terraform-validate@v1.0.0 # v1.0.0 x-release-please-version
+      with:
+        tooling-image: ${{ inputs.tooling-image }}
+        working-directory: ${{ inputs.working-directory }}
+        enable-tflint: ${{ inputs.enable-tflint }}
