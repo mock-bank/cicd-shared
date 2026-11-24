@@ -64,6 +64,14 @@ for var in GOOGLE_CLOUD_PROJECT GOOGLE_REGION; do
   fi
 done
 
+# Terraform inputs supplied through GitHub environment variables. The calling
+# workflow maps vars.* to TF_VAR_* explicitly; pass them through by name so the
+# values never appear in the docker command line or job log.
+while IFS= read -r name; do
+  [[ "$name" =~ ^TF_VAR_[A-Za-z0-9_]+$ ]] || continue
+  docker_args+=(--env "$name")
+done < <(compgen -e | grep '^TF_VAR_' | sort)
+
 docker pull "$TOOLING_IMAGE"
 docker run "${docker_args[@]}" \
   --entrypoint bash \

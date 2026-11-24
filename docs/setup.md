@@ -35,6 +35,35 @@ Create repository or environment variables:
 
 Reusable workflows read the `vars` context of the **calling** repository, so define these variables in every consumer repository (or at organization level).
 
+### Passing Terraform inputs from environment variables
+
+GitHub cannot iterate over the `vars` context in YAML, so a calling workflow
+maps each variable it needs to a `TF_VAR_*` name explicitly:
+
+```yaml
+jobs:
+  plan:
+    uses: mock-bank/cicd-shared/.github/workflows/terraform-plan.yml@<sha> # v1.0.0
+    env:
+      TF_VAR_parent_folder: ${{ vars.L1_ENV_FOLDER_ID }}
+      TF_VAR_state_bucket: ${{ vars.TFSTATE_PLAN_1_BUCKET }}
+      TF_VAR_state_cmek: ${{ vars.TFSTATE_PLAN_1_CMEK }}
+    with:
+      working-directory: infra
+      tooling-image: ${{ vars.TERRAFORM_TOOLING_IMAGE }}
+      ref: ${{ github.sha }}
+```
+
+The plan and apply container scripts forward every `TF_VAR_*` variable into the
+tooling image by name, so no `terraform.tfvars` needs to be committed. The plan
+and apply jobs must map the same variables: a missing value at apply time
+changes the saved plan's variable set and Terraform will refuse it.
+
+Stage 0 populates these variables automatically: `gcp-org-bootstrap` publishes
+its verified outputs into the plan-1 environment after apply (see
+`docs/variables.md` in that repository). `TERRAFORM_TOOLING_IMAGE` is the
+exception — its digest is produced by the publish workflow below.
+
 Create environment `tooling-publish` restricted to `v*` tags, with required reviewers. Protect `main` with CODEOWNERS and required checks, and enable squash merging so PR titles become conventional commit messages. Create an apply environment (default `terraform-production`) with required reviewers and, ideally, a deployment branch policy.
 
 ## Workflows
