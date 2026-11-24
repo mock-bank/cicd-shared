@@ -1,68 +1,86 @@
 name: Publish Terraform Tooling to GAR
 
+# Triggered by the release-please tag, so a release always has a SemVer version
+# and a changelog before any image is published. Re-run this workflow on the
+# same tag to recover a failed publish without changing the version.
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Image version (e.g. 0.1.0); do not reuse published versions"
-        required: true
-        type: string
-  # PRs should validate the Dockerfile separately, without cloud credentials.
+  push:
+    tags:
+    - 'v*'
 
 permissions:
-  contents: read
+  contents: write # Attach signed release evidence to the GitHub release
   id-token: write
 
 concurrency:
-  group: publish-terraform-tooling
+  group: publish-terraform-tooling-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   publish:
-    if: github.ref == 'refs/heads/main'
+    name: Build, sign and promote tooling image
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     environment: tooling-publish
+
     outputs:
+      version: ${{ steps.version.outputs.version }}
       digest: ${{ steps.build.outputs.digest }}
-      image: ${{ steps.target.outputs.image }}
+
     steps:
-    - name: Validate release version
-      env:
-        IMAGE_VERSION: ${{ inputs.version }}
+    - name: Resolve release version from tag
+      id: version
       run: |
-        if [[ ! "$IMAGE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-          echo 'Version must be numeric SemVer (for example, 0.1.0)' >&2
+        set -euo pipefail
+        tag="${GITHUB_REF_NAME}"
+        version="${tag#v}"
+        if [[ "$tag" != "v$version" ]]; then
+          echo 'Workflow must run from a v<semver> tag' >&2
           exit 1
         fi
+        if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+          echo 'Tag must contain numeric SemVer, for example v1.2.3' >&2
+          exit 1
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-    - name: Checkout tooling source
-      uses: actions/checkout@v4:11d5960a326750d5838078e36cf38b85af677262
+    - name: Checkout tooling source at the release tag
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
 
-    - name: Select image destination
+    - name: Select image destinations
       id: target
       env:
         GAR_LOCATION: ${{ vars.GAR_LOCATION }}
         GAR_PROJECT_ID: ${{ vars.GAR_PROJECT_ID }}
-        GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY }}
+        GAR_REPOSITORY_ALPHA: ${{ vars.GAR_REPOSITORY_ALPHA || vars.GAR_REPOSITORY }}
+        GAR_REPOSITORY_BETA: ${{ vars.GAR_REPOSITORY_BETA || 'beta' }}
+        GAR_REPOSITORY_LIVE: ${{ vars.GAR_REPOSITORY_LIVE || 'live' }}
       run: |
         set -euo pipefail
-        for var in GAR_LOCATION GAR_PROJECT_ID GAR_REPOSITORY; do
+        for var in GAR_LOCATION GAR_PROJECT_ID GAR_REPOSITORY_ALPHA GAR_REPOSITORY_BETA GAR_REPOSITORY_LIVE; do
           [[ -n "${!var}" ]] || { echo "Missing GitHub variable: $var" >&2; exit 1; }
         done
-        for value in "$GAR_LOCATION" "$GAR_PROJECT_ID" "$GAR_REPOSITORY"; do
+        for value in "$GAR_LOCATION" "$GAR_PROJECT_ID" "$GAR_REPOSITORY_ALPHA" "$GAR_REPOSITORY_BETA" "$GAR_REPOSITORY_LIVE"; do
           [[ "$value" =~ ^[a-z][a-z0-9-]*$ ]] || { echo "Invalid GAR configuration" >&2; exit 1; }
         done
-        echo "registry=${GAR_LOCATION}-docker.pkg.dev" >> "$GITHUB_OUTPUT"
-        echo "image=${GAR_LOCATION}-docker.pkg.dev/${GAR_PROJECT_ID}/${GAR_REPOSITORY}/terraform-tooling" >> "$GITHUB_OUTPUT"
+        [[ "$GAR_REPOSITORY_ALPHA" != "$GAR_REPOSITORY_BETA" ]] || { echo 'alpha and beta repositories must differ' >&2; exit 1; }
+        [[ "$GAR_REPOSITORY_BETA" != "$GAR_REPOSITORY_LIVE" ]] || { echo 'beta and live repositories must differ' >&2; exit 1; }
+
+        registry="${GAR_LOCATION}-docker.pkg.dev"
+        prefix="${registry}/${GAR_PROJECT_ID}"
+        echo "registry=$registry" >> "$GITHUB_OUTPUT"
+        echo "alpha=${prefix}/${GAR_REPOSITORY_ALPHA}/terraform-tooling" >> "$GITHUB_OUTPUT"
+        echo "beta=${prefix}/${GAR_REPOSITORY_BETA}/terraform-tooling" >> "$GITHUB_OUTPUT"
+        echo "live=${prefix}/${GAR_REPOSITORY_LIVE}/terraform-tooling" >> "$GITHUB_OUTPUT"
 
     - name: Configure Docker Buildx
-      uses: docker/setup-buildx-action@v4:f87e5991a6d7451dcb8d9637bfbc97413f497069
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
     - name: Build locally for smoke test
-      uses: docker/build-push-action@v7:c3c9e263c25d99ce0380d002d59b67737d91b0dc
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
       with:
         context: ./docker/terraform-tooling
         file: ./docker/terraform-tooling/Dockerfile
@@ -72,71 +90,159 @@ jobs:
 
     - name: Smoke test tooling
       run: |
-        docker run --rm terraform-tooling:smoke bash -lc 'terraform version && tflint --version && checkov --version && jq --version'
+        set -euo pipefail
+        docker run --rm \
+          --mount "type=bind,src=${PWD}/docker/terraform-tooling/smoke-test.sh,dst=/smoke-test.sh,readonly" \
+          terraform-tooling:smoke \
+          bash /smoke-test.sh
 
     - name: Authenticate to Google Cloud via WIF
       id: auth
-      uses: google-github-actions/auth@v3:7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
       with:
         token_format: access_token
         workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
         service_account: ${{ vars.GCP_ARTIFACT_WRITER_SA }}
 
     - name: Authenticate Docker to GAR
-      uses: docker/login-action@v4:8aa5831fb8d48d8f76594c7ddde61ae58019f550
+      uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
       with:
         registry: ${{ steps.target.outputs.registry }}
         username: oauth2accesstoken
         password: ${{ steps.auth.outputs.access_token }}
 
-    - name: Push tooling image with supply-chain attestations
+    - name: Push tooling image to alpha with attestations
       id: build
-      uses: docker/build-push-action@v7 # Pin audited SHA
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
       with:
         context: ./docker/terraform-tooling
         file: ./docker/terraform-tooling/Dockerfile
         platforms: linux/amd64
         push: true
-        tags: ${{ steps.target.outputs.image }}:${{ inputs.version }}
+        tags: ${{ steps.target.outputs.alpha }}:${{ steps.version.outputs.version }}
         provenance: mode=min
         sbom: true
         labels: |
           org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           org.opencontainers.image.revision=${{ github.sha }}
-          org.opencontainers.image.version=${{ inputs.version }}
-
-    - name: Publish immutable image digest
-      env:
-        IMAGE: ${{ steps.target.outputs.image }}
-        DIGEST: ${{ steps.build.outputs.digest }}
-      run: |
-        echo "### Terraform tooling release" >> "$GITHUB_STEP_SUMMARY"
-        echo "Image: \`${IMAGE}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
-        echo "Consumers should pin this digest, not the mutable tag." >> "$GITHUB_STEP_SUMMARY"
+          org.opencontainers.image.version=${{ steps.version.outputs.version }}
 
     - name: Install Cosign
-      uses: sigstore/cosign-installer@v4.1.0
+      uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
 
-    - name: Sign Terraform tooling image
+    - name: Sign and verify the alpha image
       env:
-        IMAGE: ${{ steps.target.outputs.image }}
+        IMAGE: ${{ steps.target.outputs.alpha }}
         DIGEST: ${{ steps.build.outputs.digest }}
         COSIGN_KMS_KEY: ${{ vars.COSIGN_KMS_KEY_URI }}
       run: |
         set -euo pipefail
+        [[ -n "$COSIGN_KMS_KEY" ]] || { echo 'Missing GitHub variable: COSIGN_KMS_KEY_URI' >&2; exit 1; }
 
-        cosign sign --yes \
-          --key "$COSIGN_KMS_KEY" \
-          "${IMAGE}@${DIGEST}"
+        cosign sign --yes --key "$COSIGN_KMS_KEY" "${IMAGE}@${DIGEST}"
+        cosign verify --key "$COSIGN_KMS_KEY" "${IMAGE}@${DIGEST}"
 
-    - name: Verify Terraform tooling signature
+    # cosign copy carries the image, signature and attestations. The same digest
+    # is promoted rather than rebuilding per environment.
+    - name: Promote signed digest to beta and live
       env:
-        IMAGE: ${{ steps.target.outputs.image }}
+        IMAGE: ${{ steps.target.outputs.alpha }}
+        BETA: ${{ steps.target.outputs.beta }}
+        LIVE: ${{ steps.target.outputs.live }}
         DIGEST: ${{ steps.build.outputs.digest }}
+        VERSION: ${{ steps.version.outputs.version }}
         COSIGN_KMS_KEY: ${{ vars.COSIGN_KMS_KEY_URI }}
       run: |
         set -euo pipefail
+        source="${IMAGE}@${DIGEST}"
+        cosign copy "$source" "${BETA}:${VERSION}"
+        cosign copy "$source" "${LIVE}:${VERSION}"
 
-        cosign verify \
-          --key "$COSIGN_KMS_KEY" \
-          "${IMAGE}@${DIGEST}"
+        for target in "${BETA}@${DIGEST}" "${LIVE}@${DIGEST}"; do
+          cosign verify --key "$COSIGN_KMS_KEY" "$target"
+        done
+
+    - name: Build release evidence
+      env:
+        VERSION: ${{ steps.version.outputs.version }}
+        TAG: ${{ steps.version.outputs.tag }}
+        DIGEST: ${{ steps.build.outputs.digest }}
+        ALPHA: ${{ steps.target.outputs.alpha }}
+        BETA: ${{ steps.target.outputs.beta }}
+        LIVE: ${{ steps.target.outputs.live }}
+        COSIGN_KMS_KEY: ${{ vars.COSIGN_KMS_KEY_URI }}
+      run: |
+        set -euo pipefail
+        evidence_dir="${RUNNER_TEMP}/terraform-tooling-release"
+        mkdir -p "$evidence_dir"
+
+        jq -n \
+          --arg version "$VERSION" \
+          --arg tag "$TAG" \
+          --arg revision "$GITHUB_SHA" \
+          --arg digest "$DIGEST" \
+          --arg alpha "${ALPHA}@${DIGEST}" \
+          --arg beta "${BETA}:${VERSION}" \
+          --arg live "${LIVE}:${VERSION}" \
+          --arg key "$COSIGN_KMS_KEY" \
+          '{
+            schema_version: 1,
+            version: $version,
+            tag: $tag,
+            revision: $revision,
+            image: {
+              tool: "terraform-tooling",
+              digest: $digest,
+              alpha: $alpha,
+              beta: $beta,
+              live: $live
+            },
+            signature: {
+              kms_key: $key,
+              verify: ("cosign verify --key " + $key + " " + $alpha)
+            },
+            consumers: {
+              reusable_workflows_ref: $tag,
+              pin_example: ("mock-bank/cicd-shared/.github/workflows/terraform-test.yml@" + $revision + " # " + $tag)
+            }
+          }' > "${evidence_dir}/release-manifest.json"
+
+        {
+          echo "## Verified tooling image"
+          echo
+          echo "- Version: \`${VERSION}\`"
+          echo "- Digest: \`${DIGEST}\`"
+          echo "- Source revision: \`${GITHUB_SHA}\`"
+          echo "- Alpha: \`${ALPHA}@${DIGEST}\`"
+          echo "- Beta: \`${BETA}@${DIGEST}\`"
+          echo "- Live: \`${LIVE}@${DIGEST}\`"
+          echo
+          echo 'Verify with:'
+          echo
+          echo '```bash'
+          echo "cosign verify --key '${COSIGN_KMS_KEY}' '${ALPHA}@${DIGEST}'"
+          echo '```'
+        } > "${evidence_dir}/VERIFY.md"
+
+    - name: Attach signed evidence to the GitHub release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        TAG: ${{ steps.version.outputs.tag }}
+        EVIDENCE_DIR: ${{ runner.temp }}/terraform-tooling-release
+      run: |
+        set -euo pipefail
+        gh release upload "$TAG" \
+          "${EVIDENCE_DIR}/release-manifest.json" \
+          "${EVIDENCE_DIR}/VERIFY.md" \
+          --repo "$GITHUB_REPOSITORY" --clobber
+
+    - name: Publish release summary
+      env:
+        VERSION: ${{ steps.version.outputs.version }}
+        DIGEST: ${{ steps.build.outputs.digest }}
+        ALPHA: ${{ steps.target.outputs.alpha }}
+      run: |
+        echo "### Terraform tooling ${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+        echo "Digest: \`${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+        echo "Alpha: \`${ALPHA}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+        echo "Consumers should pin the digest, not the mutable tag." >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,23 @@
+name: Terraform validate (Docker)
+description: Execute Terraform formatting, init and validate in a pinned tooling container
+inputs:
+  tooling-image:
+    description: Full approved image reference ending in @sha256:<64 hex characters>
+    required: true
+  working-directory:
+    description: Path to Terraform root under the checkout workspace
+    required: true
+  enable-tflint:
+    description: Run TFLint when true
+    default: 'true'
+    required: false
+runs:
+  using: composite
+  steps:
+  - name: Execute Terraform checks in Docker
+    shell: bash
+    env:
+      TOOLING_IMAGE: ${{ inputs.tooling-image }}
+      TF_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+      ENABLE_TFLINT: ${{ inputs.enable-tflint }}
+    run: bash "$GITHUB_ACTION_PATH/scripts/run-container.sh"

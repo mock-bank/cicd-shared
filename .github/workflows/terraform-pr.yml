@@ -1,0 +1,80 @@
+name: Terraform Pull Request Checks
+
+on:
+  pull_request:
+    branches:
+    - main
+
+permissions:
+  contents: read
+  id-token: write # Required by the called workflows for WIF and GAR access
+  actions: read
+
+concurrency:
+  group: terraform-pr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  configure:
+    name: Resolve shared configuration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    outputs:
+      working-directory: ${{ steps.config.outputs.working-directory }}
+      tooling-image: ${{ steps.config.outputs.tooling-image }}
+      enable-tflint: ${{ steps.config.outputs.enable-tflint }}
+      verify-image: ${{ steps.config.outputs.verify-image }}
+
+    steps:
+    - name: Validate configuration variables
+      id: config
+      env:
+        WORKING_DIRECTORY: ${{ vars.TF_WORKING_DIRECTORY || '.' }}
+        TOOLING_IMAGE: ${{ vars.TERRAFORM_TOOLING_IMAGE }}
+        ENABLE_TFLINT: ${{ vars.TF_ENABLE_TFLINT || 'true' }}
+        COSIGN_KMS_KEY: ${{ vars.COSIGN_KMS_KEY_URI }}
+      run: |
+        set -euo pipefail
+        [[ -n "$TOOLING_IMAGE" ]] || { echo 'Missing repository variable: TERRAFORM_TOOLING_IMAGE' >&2; exit 1; }
+        if [[ ! "$TOOLING_IMAGE" =~ @sha256:[a-fA-F0-9]{64}$ ]]; then
+          echo 'TERRAFORM_TOOLING_IMAGE must be pinned by sha256 digest' >&2
+          exit 1
+        fi
+        if [[ "$ENABLE_TFLINT" != true && "$ENABLE_TFLINT" != false ]]; then
+          echo 'TF_ENABLE_TFLINT must be true or false' >&2
+          exit 1
+        fi
+        echo "working-directory=$WORKING_DIRECTORY" >> "$GITHUB_OUTPUT"
+        echo "tooling-image=$TOOLING_IMAGE" >> "$GITHUB_OUTPUT"
+        echo "enable-tflint=$ENABLE_TFLINT" >> "$GITHUB_OUTPUT"
+        if [[ -n "$COSIGN_KMS_KEY" ]]; then
+          echo 'verify-image=true' >> "$GITHUB_OUTPUT"
+        else
+          echo 'verify-image=false' >> "$GITHUB_OUTPUT"
+        fi
+
+  test:
+    name: Validate Terraform
+    needs: configure
+    uses: mock-bank/cicd-shared/.github/workflows/terraform-test.yml@v1.0.0 # v1.0.0 x-release-please-version
+    with:
+      working-directory: ${{ needs.configure.outputs.working-directory }}
+      tooling-image: ${{ needs.configure.outputs.tooling-image }}
+      enable-tflint: ${{ fromJSON(needs.configure.outputs.enable-tflint) }}
+
+  security:
+    name: Scan Terraform
+    needs: configure
+    uses: mock-bank/cicd-shared/.github/workflows/terraform-security.yml@v1.0.0 # v1.0.0 x-release-please-version
+    with:
+      working-directory: ${{ needs.configure.outputs.working-directory }}
+      tooling-image: ${{ needs.configure.outputs.tooling-image }}
+
+  image:
+    name: Verify tooling image
+    needs: configure
+    if: ${{ needs.configure.outputs.verify-image == 'true' }}
+    uses: mock-bank/cicd-shared/.github/workflows/terraform-image.yml@v1.0.0 # v1.0.0 x-release-please-version
+    with:
+      tooling-image: ${{ needs.configure.outputs.tooling-image }}

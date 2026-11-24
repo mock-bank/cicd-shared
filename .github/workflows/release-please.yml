@@ -1,0 +1,37 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+    - main
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Create or update release pull request
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+    - name: Run release-please
+      id: release
+      uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        config-file: release-please-config.json
+        manifest-file: .release-please-manifest.json
+
+    - name: Publish release summary
+      if: ${{ steps.release.outputs.release_created == 'true' }}
+      env:
+        TAG: ${{ steps.release.outputs.tag_name }}
+      run: |
+        echo "### Release created" >> "$GITHUB_STEP_SUMMARY"
+        echo "Tag: \`${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+        echo "The tag push starts the tooling image publish workflow." >> "$GITHUB_STEP_SUMMARY"

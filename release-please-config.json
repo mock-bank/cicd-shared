@@ -1,0 +1,34 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "simple",
+  "version-file": "VERSION",
+  "include-component-in-tag": false,
+  "label": "autorelease: pending",
+  "release-label": "autorelease: tagged",
+  "changelog-sections": [
+    { "type": "feat", "section": "Features" },
+    { "type": "fix", "section": "Bug Fixes" },
+    { "type": "perf", "section": "Performance Improvements" },
+    { "type": "refactor", "section": "Code Refactoring" },
+    { "type": "revert", "section": "Reverts" },
+    { "type": "docs", "section": "Documentation" },
+    { "type": "chore", "section": "Miscellaneous Chores", "hidden": true },
+    { "type": "ci", "section": "Continuous Integration", "hidden": true },
+    { "type": "build", "section": "Build System", "hidden": true },
+    { "type": "test", "section": "Tests", "hidden": true },
+    { "type": "style", "section": "Style", "hidden": true }
+  ],
+  "packages": {
+    ".": {
+      "package-name": "cicd-shared",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        { "type": "generic", "path": ".github/workflows/terraform-test.yml" },
+        { "type": "generic", "path": ".github/workflows/terraform-security.yml" },
+        { "type": "generic", "path": ".github/workflows/terraform-plan.yml" },
+        { "type": "generic", "path": ".github/workflows/terraform-deploy.yml" },
+        { "type": "generic", "path": ".github/workflows/terraform-pr.yml" }
+      ]
+    }
+  }
+}

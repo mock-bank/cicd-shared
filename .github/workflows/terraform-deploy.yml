@@ -1,0 +1,119 @@
+name: Reusable Terraform Deploy
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Terraform root relative to the calling repository
+        type: string
+        required: true
+      tooling-image:
+        description: Full GAR image pinned to sha256 digest (no tags)
+        type: string
+        required: true
+      ref:
+        description: Commit to check out; must match the ref used for the plan
+        type: string
+        required: true
+      plan-artifact:
+        description: Name of the binary plan artifact produced by terraform-plan.yml
+        type: string
+        required: true
+      plan-run-id:
+        description: Run ID that produced the plan artifact
+        type: string
+        required: true
+      environment:
+        description: GitHub environment that gates approval for the apply
+        type: string
+        required: false
+        default: terraform-production
+
+permissions:
+  contents: read
+  id-token: write # Used to obtain apply credentials via WIF and read the tooling image
+  actions: read # Download the plan artifact from the plan run
+
+jobs:
+  deploy:
+    name: Apply approved Terraform plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: ${{ inputs.environment }}
+
+    concurrency:
+      group: terraform-apply-${{ inputs.environment }}-${{ inputs.working-directory }}
+      cancel-in-progress: false
+
+    steps:
+    - name: Resolve deploy configuration
+      id: target
+      env:
+        GAR_LOCATION: ${{ vars.GAR_LOCATION }}
+        PLAN_RUN_ID: ${{ inputs.plan-run-id }}
+      run: |
+        set -euo pipefail
+        for var in GAR_LOCATION GCP_WORKLOAD_IDENTITY_PROVIDER GCP_TERRAFORM_APPLY_SA; do
+          [[ -n "${!var}" ]] || { echo "Missing GitHub variable: $var" >&2; exit 1; }
+        done
+        [[ "$PLAN_RUN_ID" =~ ^[0-9]+$ ]] || { echo 'plan-run-id must be numeric' >&2; exit 1; }
+        echo "registry=${GAR_LOCATION}-docker.pkg.dev" >> "$GITHUB_OUTPUT"
+
+    - name: Checkout application repository at the planned ref
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        ref: ${{ inputs.ref }}
+        persist-credentials: false
+
+    - name: Download approved binary plan
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      with:
+        name: ${{ inputs.plan-artifact }}
+        run-id: ${{ inputs.plan-run-id }}
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        path: ${{ runner.temp }}/terraform-plan
+
+    - name: Verify downloaded plan
+      env:
+        PLAN_PATH: ${{ runner.temp }}/terraform-plan/tfplan
+      run: |
+        set -euo pipefail
+        [[ -s "$PLAN_PATH" ]] || { echo 'Plan artifact does not contain tfplan' >&2; exit 1; }
+
+    # The apply service account is scoped to a single environment by WIF and
+    # GitHub environment protection rules.
+    - name: Authenticate to Google Cloud via WIF (apply role)
+      id: auth
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        token_format: access_token
+        workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ vars.GCP_TERRAFORM_APPLY_SA }}
+        create_credentials_file: true
+        export_environment_variables: true
+
+    - name: Login to GAR (runner only)
+      uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      with:
+        registry: ${{ steps.target.outputs.registry }}
+        username: oauth2accesstoken
+        password: ${{ steps.auth.outputs.access_token }}
+
+    - name: Apply approved plan in image
+      uses: mock-bank/cicd-shared/.github/actions/terraform-apply@v1.0.0 # v1.0.0 x-release-please-version
+      with:
+        tooling-image: ${{ inputs.tooling-image }}
+        working-directory: ${{ inputs.working-directory }}
+        plan-path: ${{ runner.temp }}/terraform-plan/tfplan
+
+    - name: Publish deploy summary
+      env:
+        REF: ${{ inputs.ref }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        PLAN_ARTIFACT: ${{ inputs.plan-artifact }}
+        PLAN_RUN_ID: ${{ inputs.plan-run-id }}
+      run: |
+        echo "### Terraform apply" >> "$GITHUB_STEP_SUMMARY"
+        echo "Environment: \`${ENVIRONMENT}\`" >> "$GITHUB_STEP_SUMMARY"
+        echo "Source: \`${REF}\`" >> "$GITHUB_STEP_SUMMARY"
+        echo "Applied plan: \`${PLAN_ARTIFACT}\` from run \`${PLAN_RUN_ID}\`" >> "$GITHUB_STEP_SUMMARY"

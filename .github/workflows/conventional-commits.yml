@@ -1,0 +1,36 @@
+name: Conventional Commit Check
+
+on:
+  pull_request:
+    types:
+    - opened
+    - edited
+    - reopened
+    - synchronize
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  title:
+    name: Validate pull request title
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+    # Squash merges use the PR title as the commit message, so validating the
+    # title is what makes release-please's SemVer bump deterministic.
+    - name: Check conventional commit format
+      env:
+        TITLE: ${{ github.event.pull_request.title }}
+      run: |
+        set -euo pipefail
+        pattern='^(feat|fix|docs|chore|refactor|perf|test|build|ci|style|revert)(\([a-zA-Z0-9_./-]+\))?!?: .+'
+        if [[ ! "$TITLE" =~ $pattern ]]; then
+          echo 'PR title must be a conventional commit, for example:' >&2
+          echo '  feat(plan): add state bucket module' >&2
+          echo '  fix(security): correct report path guard' >&2
+          echo '  feat!: break consumer workflow inputs' >&2
+          exit 1
+        fi

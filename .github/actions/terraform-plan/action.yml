@@ -1,0 +1,23 @@
+name: Terraform plan (Docker)
+description: Initialise the backend and write a binary Terraform plan in a pinned tooling container
+inputs:
+  tooling-image:
+    description: Full approved image reference ending in @sha256:<64 hex characters>
+    required: true
+  working-directory:
+    description: Path to Terraform root under the checkout workspace
+    required: true
+outputs:
+  plan-path:
+    description: Path to the binary plan file on the runner
+    value: ${{ steps.plan.outputs.plan-path }}
+runs:
+  using: composite
+  steps:
+  - name: Create Terraform plan in Docker
+    id: plan
+    shell: bash
+    env:
+      TOOLING_IMAGE: ${{ inputs.tooling-image }}
+      TF_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+    run: bash "$GITHUB_ACTION_PATH/scripts/run-container.sh"

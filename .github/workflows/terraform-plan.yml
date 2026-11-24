@@ -1,0 +1,108 @@
+name: Reusable Terraform Plan
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Terraform root relative to the calling repository
+        type: string
+        required: true
+      tooling-image:
+        description: Full GAR image pinned to sha256 digest (no tags)
+        type: string
+        required: true
+      ref:
+        description: Commit to check out; the apply job must use the same ref
+        type: string
+        required: true
+    outputs:
+      plan-artifact:
+        description: Name of the uploaded binary plan artifact
+        value: ${{ jobs.plan.outputs.plan-artifact }}
+      plan-run-id:
+        description: Run ID that produced the plan artifact
+        value: ${{ jobs.plan.outputs.plan-run-id }}
+
+permissions:
+  contents: read
+  id-token: write # Used to obtain plan credentials via WIF and read the tooling image
+  actions: write # Upload the binary plan artifact
+
+jobs:
+  plan:
+    name: Terraform plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    outputs:
+      plan-artifact: ${{ steps.artifact.outputs.name }}
+      plan-run-id: ${{ github.run_id }}
+
+    steps:
+    - name: Resolve plan configuration
+      id: target
+      env:
+        GAR_LOCATION: ${{ vars.GAR_LOCATION }}
+      run: |
+        set -euo pipefail
+        for var in GAR_LOCATION GCP_WORKLOAD_IDENTITY_PROVIDER GCP_TERRAFORM_PLAN_SA; do
+          [[ -n "${!var}" ]] || { echo "Missing GitHub variable: $var" >&2; exit 1; }
+        done
+        echo "registry=${GAR_LOCATION}-docker.pkg.dev" >> "$GITHUB_OUTPUT"
+
+    - name: Checkout application repository
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        ref: ${{ inputs.ref }}
+        persist-credentials: false
+
+    # Credentials are written under RUNNER_TEMP by the auth action and mounted
+    # into the container from there, never from the checkout workspace.
+    - name: Authenticate to Google Cloud via WIF (plan role)
+      id: auth
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        token_format: access_token
+        workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ vars.GCP_TERRAFORM_PLAN_SA }}
+        create_credentials_file: true
+        export_environment_variables: true
+
+    - name: Login to GAR (runner only)
+      uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      with:
+        registry: ${{ steps.target.outputs.registry }}
+        username: oauth2accesstoken
+        password: ${{ steps.auth.outputs.access_token }}
+
+    - name: Create Terraform plan in image
+      id: plan
+      uses: mock-bank/cicd-shared/.github/actions/terraform-plan@v1.0.0 # v1.0.0 x-release-please-version
+      with:
+        tooling-image: ${{ inputs.tooling-image }}
+        working-directory: ${{ inputs.working-directory }}
+
+    - name: Set plan artifact name
+      id: artifact
+      run: |
+        set -euo pipefail
+        echo "name=terraform-plan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+    # The binary plan can contain sensitive values. Keep retention short and
+    # restrict access to the repository's Actions users.
+    - name: Upload binary plan
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ steps.artifact.outputs.name }}
+        path: ${{ steps.plan.outputs.plan-path }}
+        if-no-files-found: error
+        retention-days: 7
+
+    - name: Publish plan summary
+      env:
+        ARTIFACT: ${{ steps.artifact.outputs.name }}
+        REF: ${{ inputs.ref }}
+      run: |
+        echo "### Terraform plan" >> "$GITHUB_STEP_SUMMARY"
+        echo "Source: \`${REF}\`" >> "$GITHUB_STEP_SUMMARY"
+        echo "Artifact: \`${ARTIFACT}\`" >> "$GITHUB_STEP_SUMMARY"
